@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Triple Pipeline DevOps en AWS</title>
+  <style>
+    body { font-family: Arial, sans-serif; background: #f2f4f8; margin: 0; padding: 40px; color: #1f2937; }
+    .card { max-width: 720px; margin: auto; background: #fff; padding: 32px; border-radius: 12px; box-shadow: 0 4px 16px rgba(0,0,0,.08); }
+    h1 { color: #232f3e; margin-top: 0; }
+    input { width: 100%; padding: 10px; font-size: 15px; border: 1px solid #cbd5e1; border-radius: 6px; box-sizing: border-box; }
+    button { margin-top: 12px; padding: 10px 18px; background: #ff9900; color: #fff; border: 0; border-radius: 6px; font-size: 15px; cursor: pointer; }
+    pre { background: #0f172a; color: #e2e8f0; padding: 16px; border-radius: 8px; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Triple Pipeline DevOps en AWS ECS</h1>
+    <p>Ingresa la IP pública de la tarea Backend en ECS (ej. http://54.12.34.56:3000):</p>
+    <input id="url" type="text" placeholder="http://IP_BACKEND:3000">
+    <button onclick="consultar()">Consultar Backend</button>
+    <pre id="salida">Esperando consulta...</pre>
+  </div>
+  <script>
+    async function consultar() {
+      const base = document.getElementById('url').value.trim().replace(/\/$/, '');
+      const salida = document.getElementById('salida');
+      salida.textContent = 'Consultando...';
+      try {
+        const health = await (await fetch(base + '/api/health')).json();
+        const tareas = await (await fetch(base + '/api/tareas')).json();
+        salida.textContent = JSON.stringify({ health, tareas }, null, 2);
+      } catch (e) {
+        salida.textContent = 'Error al conectar con el backend: ' + e.message;
+      }
+    }
+  </script>
+</body>
+</html>
