@@ -1,0 +1,54 @@
+name: Pipeline 2 - Codigo y Publicacion en ECR
+on:
+  workflow_dispatch:
+  push:
+    paths: ['aplicacion/**']
+
+jobs:
+  build-test-push:
+    name: 1-6. Build, Pruebas, Docker Build y Push ECR
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. Checkout Repositorio de Codigo
+        uses: actions/checkout@v4
+
+      - name: Instalar Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: 2. Build (Instalar dependencias Backend)
+        working-directory: ./aplicacion/backend
+        run: npm install
+
+      - name: 3. Pruebas Unitarias y de API
+        working-directory: ./aplicacion/backend
+        run: npm test
+
+      - name: Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login en Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: 4-6. Docker Build, Push y Versionado (SHA + latest)
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          VERSION: ${{ github.sha }}
+        run: |
+          SHORT_SHA=${VERSION::7}
+          # Backend versionado con SHA corto y latest
+          docker build -t $REGISTRY/devops-final-backend:$SHORT_SHA -t $REGISTRY/devops-final-backend:latest ./aplicacion/backend
+          docker push $REGISTRY/devops-final-backend:$SHORT_SHA
+          docker push $REGISTRY/devops-final-backend:latest
+          # Frontend versionado con SHA corto y latest
+          docker build -t $REGISTRY/devops-final-frontend:$SHORT_SHA -t $REGISTRY/devops-final-frontend:latest ./aplicacion/frontend
+          docker push $REGISTRY/devops-final-frontend:$SHORT_SHA
+          docker push $REGISTRY/devops-final-frontend:latest
+          echo "Salida: Imagenes versionadas con tag $SHORT_SHA en ECR"

@@ -1,0 +1,111 @@
+name: Pipeline 3 - Despliegue y Monitoreo ECS
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Tag de imagen en ECR (ej. latest o SHA corto)'
+        required: true
+        default: 'latest'
+  workflow_run:
+    workflows: ["Pipeline 2 - Codigo y Publicacion en ECR"]
+    types: [completed]
+
+jobs:
+  preparar-y-qa:
+    name: 1-3. Seleccionar Imagen, Actualizar Task Def y QA
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    outputs:
+      back_td_arn: ${{ steps.reg-td.outputs.back_td_arn }}
+      front_td_arn: ${{ steps.reg-td.outputs.front_td_arn }}
+    steps:
+      - name: Configurar AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: 1-2. Seleccionar Imagen ECR y Registrar Nueva Task Definition
+        id: reg-td
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          REGION=${{ secrets.AWS_REGION }}
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            TAG=$(echo "${{ github.event.workflow_run.head_sha }}" | cut -c1-7)
+          else
+            TAG="${{ github.event.inputs.image_tag }}"
+          fi
+          echo "Tag de imagen seleccionado: $TAG"
+          ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/LabRole"
+          REGISTRY="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com"
+
+          BACK_DEF=$(jq -nc --arg img "$REGISTRY/devops-final-backend:$TAG" --arg tag "$TAG" --arg region "$REGION" \
+            '[{name:"backend",image:$img,essential:true,portMappings:[{containerPort:3000,hostPort:3000}],environment:[{name:"APP_VERSION",value:$tag}],logConfiguration:{logDriver:"awslogs",options:{"awslogs-group":"/ecs/devops-final-backend","awslogs-region":$region,"awslogs-stream-prefix":"backend"}}}]')
+          FRONT_DEF=$(jq -nc --arg img "$REGISTRY/devops-final-frontend:$TAG" --arg region "$REGION" \
+            '[{name:"frontend",image:$img,essential:true,portMappings:[{containerPort:80,hostPort:80}],logConfiguration:{logDriver:"awslogs",options:{"awslogs-group":"/ecs/devops-final-frontend","awslogs-region":$region,"awslogs-stream-prefix":"frontend"}}}]')
+
+          # Registrar nueva revision Backend con version exacta
+          BACK_ARN=$(aws ecs register-task-definition --family devops-final-backend-task \
+            --network-mode awsvpc --requires-compatibilities FARGATE --cpu 256 --memory 512 \
+            --execution-role-arn $ROLE_ARN --container-definitions "$BACK_DEF" \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+
+          # Registrar nueva revision Frontend
+          FRONT_ARN=$(aws ecs register-task-definition --family devops-final-frontend-task \
+            --network-mode awsvpc --requires-compatibilities FARGATE --cpu 256 --memory 512 \
+            --execution-role-arn $ROLE_ARN --container-definitions "$FRONT_DEF" \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+
+          echo "back_td_arn=$BACK_ARN" >> $GITHUB_OUTPUT
+          echo "front_td_arn=$FRONT_ARN" >> $GITHUB_OUTPUT
+
+      - name: 3. Validacion Pre-Despliegue (QA Check)
+        run: |
+          aws ecs describe-task-definition --task-definition ${{ steps.reg-td.outputs.back_td_arn }} --query 'taskDefinition.status'
+          aws ecs describe-task-definition --task-definition ${{ steps.reg-td.outputs.front_td_arn }} --query 'taskDefinition.status'
+          echo "Task Definitions validadas y listas para aprobacion de produccion"
+
+  deploy-prod-y-monitoreo:
+    name: 4-6. Aprobacion, Deploy Prod y Monitoreo
+    needs: preparar-y-qa
+    runs-on: ubuntu-latest
+    environment: produccion-deploy # Pausa para aprobacion manual antes de produccion
+    steps:
+      - name: Configurar AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: 5. Deploy Produccion en Amazon ECS
+        run: |
+          aws ecs update-service --cluster devops-final-cluster --service devops-final-backend-svc --task-definition ${{ needs.preparar-y-qa.outputs.back_td_arn }} --desired-count 1 --force-new-deployment > /dev/null
+          aws ecs update-service --cluster devops-final-cluster --service devops-final-frontend-svc --task-definition ${{ needs.preparar-y-qa.outputs.front_td_arn }} --desired-count 1 --force-new-deployment > /dev/null
+          echo "Servicios actualizados en ECS"
+
+      - name: 6. Monitoreo y Health Check HTTP Automatizado
+        run: |
+          aws ecs wait services-stable --cluster devops-final-cluster --services devops-final-backend-svc devops-final-frontend-svc
+
+          get_ip () {
+            TASK=$(aws ecs list-tasks --cluster devops-final-cluster --service-name $1 --desired-status RUNNING --query 'taskArns[0]' --output text)
+            ENI=$(aws ecs describe-tasks --cluster devops-final-cluster --tasks $TASK --query "tasks[0].attachments[0].details[?name=='networkInterfaceId'].value" --output text)
+            aws ec2 describe-network-interfaces --network-interface-ids $ENI --query 'NetworkInterfaces[0].Association.PublicIp' --output text
+          }
+          BACK_IP=$(get_ip devops-final-backend-svc)
+          FRONT_IP=$(get_ip devops-final-frontend-svc)
+
+          echo "=========================================="
+          echo "FRONTEND URL: http://${FRONT_IP}"
+          echo "BACKEND API:  http://${BACK_IP}:3000"
+          echo "=========================================="
+          curl -sf --retry 5 --retry-delay 5 --retry-all-errors http://${BACK_IP}:3000/api/health
+          echo
+          curl -sI -f --retry 5 --retry-delay 5 --retry-all-errors http://${FRONT_IP}
+          echo "Monitoreo OK: ambos servicios responden HTTP 200" >> $GITHUB_STEP_SUMMARY
+          echo "- Frontend: http://${FRONT_IP}" >> $GITHUB_STEP_SUMMARY
+          echo "- Backend: http://${BACK_IP}:3000/api/health" >> $GITHUB_STEP_SUMMARY
